@@ -732,6 +732,27 @@ def verificar_agendamiento_en_perfil(driver, cita_data, update_callback, gui_cal
         time.sleep(1.5)
     return False
 
+def detect_backend_outage_error(driver):
+    """Detecta errores de backend SURA (WebLogic/Oracle) visibles en la página."""
+    try:
+        page_text = str(driver.page_source or "").lower()
+    except Exception:
+        return False
+
+    patrones = [
+        "alerta: ocurrio un error inesperado",
+        "alerta: ocurrió un error inesperado",
+        "weblogic.common.resourceexception",
+        "resourceexception: could not create pool connection",
+        "resourcepool.resourcedisabledexception",
+        "pool agendawebcoreds is suspended",
+        "could not create pool connection for datasource 'agendawebcoreds'",
+        "ora-28000",
+        "the account is locked",
+        "agew-0599999",
+    ]
+    return any(p in page_text for p in patrones)
+
 def check_appointments(cookie_path, headless, single_run, show_popup_ui, date_start, date_end, time_start, time_end, interval, use_sound, alert_block, stop_event, update_callback, gui_callback, action_queue, get_filters_callback=None):
     driver = None
     try:
@@ -804,10 +825,56 @@ def check_appointments(cookie_path, headless, single_run, show_popup_ui, date_st
         last_seen_citas = set() 
         is_baseline_scan = True 
         stop_after_auto_action = False
+        backend_outage_streak = 0
+        backend_outage_popup_shown = False
 
         last_filters_signature = None
 
+        def handle_backend_outage_if_needed():
+            nonlocal backend_outage_streak, backend_outage_popup_shown
+
+            if not detect_backend_outage_error(driver):
+                if backend_outage_streak > 0:
+                    update_callback("✅ Conexión con SURA restablecida. Continuando monitoreo normal.")
+                    if gui_callback:
+                        gui_callback("show_info_popup", "SURA volvió a responder correctamente. El monitoreo continúa.")
+                backend_outage_streak = 0
+                backend_outage_popup_shown = False
+                return False
+
+            backend_outage_streak += 1
+            wait_seconds = min(300, 60 + (backend_outage_streak - 1) * 60)
+            update_callback(
+                "⚠️ SURA reporta falla temporal de backend (WebLogic/Oracle). "
+                f"Reintento automático en {wait_seconds}s (intento {backend_outage_streak})."
+            )
+            if gui_callback and (not backend_outage_popup_shown):
+                backend_outage_popup_shown = True
+                gui_callback(
+                    "show_warning_popup",
+                    "SURA devolvió un error interno del servidor (no es tu configuración/cookies).\n\n"
+                    "El bot esperará y reintentará automáticamente."
+                )
+
+            while wait_seconds > 0 and (not stop_event.is_set()):
+                time.sleep(1)
+                wait_seconds -= 1
+
+            try:
+                # Método de recuperación habitual: forzar retorno a Asignación sin disparar consulta vacía.
+                ir_a_perfil_con_clic(driver, update_callback, fast_mode=True)
+                ir_a_asignacion_con_clic(driver, update_callback, fast_mode=True)
+                driver.get(cita_url)
+                time.sleep(2)
+                limpiar_popups(driver, update_callback)
+            except Exception:
+                pass
+            return True
+
         while not stop_event.is_set():
+
+            if handle_backend_outage_if_needed():
+                continue
             
             # --- DETECCIÓN DE CADUCIDAD POR URL ---
             current_url = driver.current_url.lower()
@@ -918,6 +985,11 @@ def check_appointments(cookie_path, headless, single_run, show_popup_ui, date_st
                         extraer_perfil_silencioso(driver, update_callback, gui_callback)
                     except Exception as e2:
                         update_callback(f"⚠️ También falló fallback F5: {e2}")
+
+            # Segunda barrera: si aparece el error justo antes de consultar disponibilidad,
+            # lo manejamos aquí mismo sin lanzar consultas sobre una vista rota.
+            if handle_backend_outage_if_needed():
+                continue
 
             citas_encontradas = []
             current_seen_citas = set()
