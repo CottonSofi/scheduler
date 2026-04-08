@@ -13,11 +13,6 @@ import random
 import tempfile
 import subprocess
 from datetime import datetime
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.support.ui import Select
-from selenium.common.exceptions import UnexpectedAlertPresentException, NoAlertPresentException, TimeoutException
 
 try:
     import winsound
@@ -28,8 +23,22 @@ except ImportError:
 try:
     from selenium import webdriver
     from selenium.webdriver.chrome.options import Options
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.support import expected_conditions as EC
+    from selenium.webdriver.support.ui import Select
+    from selenium.common.exceptions import UnexpectedAlertPresentException, NoAlertPresentException, TimeoutException
     HAS_SELENIUM = True
 except ImportError:
+    webdriver = None
+    Options = None
+    By = None
+    WebDriverWait = None
+    EC = None
+    Select = None
+    UnexpectedAlertPresentException = None
+    NoAlertPresentException = Exception
+    TimeoutException = Exception
     HAS_SELENIUM = False
 
 # ==========================================
@@ -249,21 +258,29 @@ def load_config():
 
 def set_startup(enable):
     startup_dir = os.path.join(os.environ["APPDATA"], r"Microsoft\Windows\Start Menu\Programs\Startup")
+    vbs_path = os.path.join(startup_dir, "SuraGestorCitas.vbs")
     bat_path = os.path.join(startup_dir, "SuraGestorCitas.bat")
+    pythonw_exe = os.path.join(os.path.dirname(os.path.abspath(sys.executable)), "pythonw.exe")
+    if not os.path.isfile(pythonw_exe):
+        pythonw_exe = sys.executable
     if enable:
         try:
-            python_exe = sys.executable
             script_path = os.path.abspath(__file__)
-            script_dir = os.path.dirname(script_path)
-            with open(bat_path, "w") as f: 
+            if os.path.exists(bat_path):
+                os.remove(bat_path)
+            with open(vbs_path, "w", encoding="utf-8") as f:
                 f.write(
-                    "@echo off\n"
-                    f'cd /d "{script_dir}"\n'
-                    f'"{python_exe}" "{script_path}"\n'
+                    'Set shell = CreateObject("WScript.Shell")\n'
+                    f'shell.Run Chr(34) & "{pythonw_exe}" & Chr(34) & " " & Chr(34) & "{script_path}" & Chr(34), 0, False\n'
                 )
         except Exception: 
             pass
     else:
+        if os.path.exists(vbs_path):
+            try:
+                os.remove(vbs_path)
+            except: 
+                pass
         if os.path.exists(bat_path):
             try: 
                 os.remove(bat_path)
@@ -2337,5 +2354,13 @@ class AlerterGUI:
 
 if __name__ == "__main__":
     root = tk.Tk()
+    if not HAS_SELENIUM:
+        root.withdraw()
+        messagebox.showerror(
+            "Dependencia faltante",
+            "Falta instalar la dependencia 'selenium'.\n\nInstala las dependencias con:\npy -m pip install -r requirements.txt\n\nLuego vuelve a abrir la aplicación.",
+        )
+        root.destroy()
+        raise SystemExit(1)
     app = AlerterGUI(root)
     root.mainloop()
