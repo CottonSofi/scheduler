@@ -12,6 +12,7 @@ import queue
 import random
 import tempfile
 import subprocess
+import ctypes
 from datetime import datetime
 
 try:
@@ -140,6 +141,72 @@ def extract_first_date_from_text(text):
 def normalize_text(text):
     return re.sub(r"\s+", " ", str(text or "").strip().lower())
 
+def detect_windows_monitors_fallback():
+    monitors = []
+    try:
+        if os.name == "nt":
+            user32 = ctypes.windll.user32
+            gdi32 = ctypes.windll.gdi32
+
+            class RECT(ctypes.Structure):
+                _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long), ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+
+            class MONITORINFOEXW(ctypes.Structure):
+                _fields_ = [
+                    ("cbSize", ctypes.c_ulong),
+                    ("rcMonitor", RECT),
+                    ("rcWork", RECT),
+                    ("dwFlags", ctypes.c_ulong),
+                    ("szDevice", ctypes.c_wchar * 32),
+                ]
+
+            MONITORENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong, ctypes.POINTER(RECT), ctypes.c_long)
+
+            def _enum_proc(hMonitor, hdcMonitor, lprcMonitor, dwData):
+                info = MONITORINFOEXW()
+                info.cbSize = ctypes.sizeof(MONITORINFOEXW)
+                if user32.GetMonitorInfoW(hMonitor, ctypes.byref(info)):
+                    rect = info.rcMonitor
+                    monitors.append(
+                        {
+                            "device": str(info.szDevice or ""),
+                            "left": int(rect.left),
+                            "top": int(rect.top),
+                            "width": int(rect.right - rect.left),
+                            "height": int(rect.bottom - rect.top),
+                            "primary": bool(info.dwFlags & 1),
+                        }
+                    )
+                return 1
+
+            user32.EnumDisplayMonitors(0, 0, MONITORENUMPROC(_enum_proc), 0)
+    except Exception:
+        monitors = []
+
+    if not monitors:
+        try:
+            root = tk._default_root
+            width = int(root.winfo_screenwidth()) if root else 1920
+            height = int(root.winfo_screenheight()) if root else 1080
+        except Exception:
+            width, height = 1920, 1080
+        monitors = [
+            {
+                "device": "default",
+                "left": 0,
+                "top": 0,
+                "width": width,
+                "height": height,
+                "primary": True,
+            }
+        ]
+
+    monitors.sort(key=lambda item: (not bool(item.get("primary", False)), int(item.get("left", 0)), int(item.get("top", 0))))
+    for idx, item in enumerate(monitors, start=1):
+        item["id"] = idx
+        item["label"] = f"Monitor {idx} ({int(item.get('width', 0))}x{int(item.get('height', 0))} @ {int(item.get('left', 0))},{int(item.get('top', 0))})"
+    return monitors
+
 # ==========================================
 # SISTEMA DE ARCHIVOS Y JSON
 # ==========================================
@@ -164,6 +231,36 @@ def get_default_cookies_path():
         if os.path.exists(p): 
             return p
     return "" 
+
+def resolve_portable_cookie_path(raw_path):
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    clean = str(raw_path or "").strip()
+    if not clean:
+        return ""
+
+    if not os.path.isabs(clean):
+        return os.path.abspath(os.path.join(base_dir, clean))
+
+    if os.path.isfile(clean):
+        return os.path.abspath(clean)
+
+    normalized = clean.replace("\\", "/")
+    lowered = normalized.lower()
+    mappings = [
+        ("/message/alerter/", base_dir),
+        ("/message/", os.path.dirname(base_dir)),
+        ("/alerter/", base_dir),
+    ]
+    for marker, target_root in mappings:
+        idx = lowered.find(marker)
+        if idx == -1:
+            continue
+        suffix = normalized[idx + len(marker):].strip("/")
+        if not suffix:
+            return os.path.abspath(target_root)
+        return os.path.abspath(os.path.join(target_root, *suffix.split("/")))
+
+    return os.path.abspath(clean)
 
 def load_cookies(driver, filepath):
     if not filepath or not os.path.exists(filepath): 
@@ -258,6 +355,7 @@ def load_config():
 
 def set_startup(enable):
     startup_dir = os.path.join(os.environ["APPDATA"], r"Microsoft\Windows\Start Menu\Programs\Startup")
+    os.makedirs(startup_dir, exist_ok=True)
     vbs_path = os.path.join(startup_dir, "SuraGestorCitas.vbs")
     bat_path = os.path.join(startup_dir, "SuraGestorCitas.bat")
     pythonw_exe = os.path.join(os.path.dirname(os.path.abspath(sys.executable)), "pythonw.exe")
@@ -271,7 +369,8 @@ def set_startup(enable):
             with open(vbs_path, "w", encoding="utf-8") as f:
                 f.write(
                     'Set shell = CreateObject("WScript.Shell")\n'
-                    f'shell.Run Chr(34) & "{pythonw_exe}" & Chr(34) & " " & Chr(34) & "{script_path}" & Chr(34), 0, False\n'
+                    'Set fso = CreateObject("Scripting.FileSystemObject")\n'
+                    f'If fso.FileExists("{pythonw_exe}") And fso.FileExists("{script_path}") Then shell.Run Chr(34) & "{pythonw_exe}" & Chr(34) & " " & Chr(34) & "{script_path}" & Chr(34), 0, False\n'
                 )
         except Exception: 
             pass
@@ -405,6 +504,80 @@ def wait_for_results_table(driver, timeout=2.2):
         )
     except TimeoutException:
         pass
+
+def consultar_disponibilidad_con_preferencia_fecha(driver, update_callback=None, fecha_preferida="", usar_preferencia=False):
+    """Resuelve el flujo de consulta cuando SURA muestra modal de fecha deseada."""
+    fecha_iso = ""
+    if usar_preferencia and str(fecha_preferida or "").strip():
+        parsed = parse_date(str(fecha_preferida).strip())
+        if parsed:
+            fecha_iso = parsed.strftime("%Y-%m-%d")
+        elif update_callback:
+            update_callback(f"⚠️ Fecha preferida SURA inválida: {fecha_preferida}")
+
+    try:
+        driver.execute_script("if(typeof consultarDisponibilidadCitas === 'function') consultarDisponibilidadCitas();")
+    except Exception:
+        return False
+
+    modal_visible = False
+    try:
+        WebDriverWait(driver, 2.0).until(
+            lambda d: d.execute_script(
+                """
+                const m = document.querySelector('#disponible');
+                if (!m) return false;
+                const cls = (m.className || '').toLowerCase();
+                const st = (m.style && m.style.display) ? m.style.display.toLowerCase() : '';
+                return cls.includes('show') || st === 'block';
+                """
+            )
+        )
+        modal_visible = True
+    except Exception:
+        modal_visible = False
+
+    if modal_visible and fecha_iso:
+        try:
+            set_ok = bool(driver.execute_script(
+                """
+                const input = document.querySelector('#recipient-date') || document.querySelector('input[type="date"]');
+                if (!input) return false;
+                input.value = arguments[0];
+                input.dispatchEvent(new Event('input', { bubbles: true }));
+                input.dispatchEvent(new Event('change', { bubbles: true }));
+                return true;
+                """,
+                fecha_iso,
+            ))
+            if set_ok and update_callback:
+                update_callback(f"📅 Fecha preferida SURA aplicada: {fecha_iso}")
+        except Exception:
+            pass
+
+    try:
+        clicked = bool(driver.execute_script(
+            """
+            const btn = document.querySelector('#disponible button[onclick*="consultarDisponibilidadCitasResolucion"]')
+              || document.querySelector('button[onclick*="consultarDisponibilidadCitasResolucion"]');
+            if (btn) {
+              btn.click();
+              return true;
+            }
+            if (typeof consultarDisponibilidadCitasResolucion === 'function') {
+              consultarDisponibilidadCitasResolucion();
+              return true;
+            }
+            return false;
+            """
+        ))
+        return clicked
+    except Exception:
+        try:
+            driver.execute_script("if(typeof consultarDisponibilidadCitasResolucion === 'function') consultarDisponibilidadCitasResolucion();")
+            return True
+        except Exception:
+            return False
 
 def confirmar_accion_con_regex(driver, update_callback=None, timeout=12):
     """Intenta confirmar un modal buscando primero botones tipo 'sí' y luego 'aceptar'."""
@@ -1016,16 +1189,31 @@ def check_appointments(cookie_path, headless, single_run, show_popup_ui, date_st
             scan_started_at = time.time()
             opciones_totales = 0
             opciones_analizadas = 0
+            pre_dynamic_filters = {}
+            pre_sura_pref_enabled = False
+            pre_sura_pref_date = ""
+
+            if callable(get_filters_callback):
+                try:
+                    pre_dynamic_filters = get_filters_callback() or {}
+                except Exception:
+                    pre_dynamic_filters = {}
+
+            if isinstance(pre_dynamic_filters, dict):
+                pre_sura_pref_enabled = bool(pre_dynamic_filters.get("sura_pref_enabled", False))
+                pre_sura_pref_date = (pre_dynamic_filters.get("sura_pref_date") or "").strip()
 
             limpiar_popups(driver, update_callback)
 
             try:
                 btn_previa = driver.find_elements(By.XPATH, "//button[contains(@onclick, 'consultarDisponibilidadCitas()')]")
                 if btn_previa:
-                    driver.execute_script("consultarDisponibilidadCitas();")
-                    wait_for_results_table(driver, timeout=1.3)
-                    limpiar_popups(driver, update_callback) 
-                    driver.execute_script("consultarDisponibilidadCitasResolucion();")
+                    consultar_disponibilidad_con_preferencia_fecha(
+                        driver,
+                        update_callback,
+                        fecha_preferida=pre_sura_pref_date,
+                        usar_preferencia=pre_sura_pref_enabled,
+                    )
                     wait_for_results_table(driver, timeout=2.0)
             except Exception: 
                 pass
@@ -1069,6 +1257,8 @@ def check_appointments(cookie_path, headless, single_run, show_popup_ui, date_st
                 auto_target_date = parse_date(auto_target_date_raw) if auto_target_date_raw else None
                 auto_target_time_raw = (dynamic_filters.get("auto_target_time") or "").strip() if isinstance(dynamic_filters, dict) else ""
                 auto_target_time = parse_time(auto_target_time_raw) if auto_target_time_raw else None
+                sura_pref_enabled = bool(dynamic_filters.get("sura_pref_enabled", False)) if isinstance(dynamic_filters, dict) else False
+                sura_pref_date_raw = (dynamic_filters.get("sura_pref_date") or "").strip() if isinstance(dynamic_filters, dict) else ""
 
                 d_start = parse_date(active_date_start) if active_date_start else None
                 d_end = parse_date(active_date_end) if active_date_end else None
@@ -1083,6 +1273,8 @@ def check_appointments(cookie_path, headless, single_run, show_popup_ui, date_st
                     auto_post_action,
                     auto_target_date_raw,
                     auto_target_time_raw,
+                    sura_pref_enabled,
+                    sura_pref_date_raw,
                 )
                 if filters_signature != last_filters_signature:
                     filtro_log = "📋 Filtros activos: "
@@ -1097,6 +1289,10 @@ def check_appointments(cookie_path, headless, single_run, show_popup_ui, date_st
                         filtro_log += f" | Día objetivo {auto_target_date.isoformat()}"
                     if auto_target_time:
                         filtro_log += f" | Objetivo {auto_target_time.strftime('%H:%M')}"
+                    if sura_pref_enabled:
+                        filtro_log += " | Preferencia consulta SURA activa"
+                        if sura_pref_date_raw:
+                            filtro_log += f" ({sura_pref_date_raw})"
                     update_callback(filtro_log)
                     last_filters_signature = filters_signature
 
@@ -1347,6 +1543,8 @@ class AlerterGUI:
         self.all_citas = []
         self.citas_map = {}
         self.perfil_map = {}
+        self.monitors = detect_windows_monitors_fallback()
+        self.monitor_labels = [item.get("label", f"Monitor {idx}") for idx, item in enumerate(self.monitors, start=1)]
 
         # Variables de Config
         self.cookie_var = tk.StringVar(value=get_default_cookies_path())
@@ -1357,7 +1555,7 @@ class AlerterGUI:
         self.interval_random_var = tk.BooleanVar(value=False)
         self.interval_min_var = tk.StringVar(value="60")
         self.interval_max_var = tk.StringVar(value="90")
-        self.monitor_var = tk.StringVar(value="Pantalla Principal (1)")
+        self.monitor_var = tk.StringVar(value=self.monitor_labels[0] if self.monitor_labels else "Monitor 1")
         self.headless_var = tk.BooleanVar(value=False)
         self.sound_var = tk.BooleanVar(value=True)
         self.popup_var = tk.BooleanVar(value=True)
@@ -1371,6 +1569,8 @@ class AlerterGUI:
         self.auto_post_action_var = tk.StringVar(value="Detener tras ejecutar")
         self.auto_target_date_var = tk.StringVar(value="")
         self.auto_target_time_var = tk.StringVar(value="")
+        self.sura_pref_enabled_var = tk.BooleanVar(value=False)
+        self.sura_pref_date_var = tk.StringVar(value="")
         self._auto_mode_lock = False
         self._priority_hint_shown = False
 
@@ -1402,6 +1602,8 @@ class AlerterGUI:
             data["auto_post_action"] = str(self.auto_post_action_var.get() or "Detener tras ejecutar")
             data["auto_target_date"] = str(self.auto_target_date_var.get() or "").strip()
             data["auto_target_time"] = str(self.auto_target_time_var.get() or "").strip()
+            data["sura_pref_enabled"] = bool(self.sura_pref_enabled_var.get())
+            data["sura_pref_date"] = str(self.sura_pref_date_var.get() or "").strip()
             return data
 
     def _get_interval_settings(self):
@@ -1450,6 +1652,49 @@ class AlerterGUI:
         self._update_interval_controls_state()
         self.save_config()
 
+    def _update_sura_pref_controls_state(self):
+        enabled = bool(self.sura_pref_enabled_var.get())
+        if hasattr(self, "sura_pref_date_entry"):
+            self.sura_pref_date_entry.configure(state="normal" if enabled else "disabled")
+
+    def _monitor_id_by_label(self, label):
+        target = normalize_text(label)
+        for item in self.monitors:
+            if normalize_text(item.get("label")) == target:
+                return int(item.get("id", 1))
+        if "izquierda" in target and self.monitors:
+            return int(sorted(self.monitors, key=lambda item: (int(item.get("left", 0)), int(item.get("top", 0))))[0].get("id", 1))
+        if "derecha" in target and self.monitors:
+            return int(sorted(self.monitors, key=lambda item: (-int(item.get("left", 0)), int(item.get("top", 0))))[0].get("id", 1))
+        return int(self.monitors[0].get("id", 1)) if self.monitors else 1
+
+    def _monitor_by_id(self, monitor_id):
+        for item in self.monitors:
+            if int(item.get("id", -1)) == int(monitor_id):
+                return item
+        return self.monitors[0] if self.monitors else None
+
+    def _selected_monitor(self):
+        return self._monitor_by_id(self._monitor_id_by_label(self.monitor_var.get()))
+
+    def _normalize_monitor_selection(self, config):
+        monitor_id = config.get("monitor_id")
+        if monitor_id is not None:
+            monitor = self._monitor_by_id(monitor_id)
+            if monitor:
+                self.monitor_var.set(monitor.get("label", self.monitor_var.get()))
+                return
+
+        monitor_label = str(config.get("monitor", "") or "").strip()
+        if monitor_label:
+            monitor_id = self._monitor_id_by_label(monitor_label)
+            monitor = self._monitor_by_id(monitor_id)
+            if monitor:
+                self.monitor_var.set(monitor.get("label", self.monitor_var.get()))
+
+    def _monitor_combo_values(self):
+        return [item.get("label", f"Monitor {idx}") for idx, item in enumerate(self.monitors, start=1)]
+
     def select_cookie_path(self):
         path = filedialog.askopenfilename(title="Seleccionar archivo de cookies", filetypes=[("Archivos de Texto", "*.txt"), ("Todos los archivos", "*.*")])
         if path:
@@ -1461,7 +1706,11 @@ class AlerterGUI:
         self.log(f"📁 Carpeta de datos activa: {data_dir}")
         config = load_config()
         if config:
-            self.cookie_var.set(config.get("cookie_path", self.cookie_var.get()))
+            configured_cookie = config.get("cookie_path", self.cookie_var.get())
+            resolved_cookie = resolve_portable_cookie_path(configured_cookie)
+            if not os.path.isfile(resolved_cookie):
+                resolved_cookie = get_default_cookies_path()
+            self.cookie_var.set(resolved_cookie)
             self.date_start_var.set(config.get("date_start", ""))
             self.date_end_var.set(config.get("date_end", ""))
             self.time_start_var.set(config.get("time_start", ""))
@@ -1470,7 +1719,7 @@ class AlerterGUI:
             self.interval_random_var.set(config.get("interval_random", False))
             self.interval_min_var.set(str(config.get("interval_min", legacy_interval)))
             self.interval_max_var.set(str(config.get("interval_max", config.get("interval_min", legacy_interval))))
-            self.monitor_var.set(config.get("monitor", "Pantalla Principal (1)"))
+            self.monitor_var.set(config.get("monitor", self.monitor_labels[0] if self.monitor_labels else "Monitor 1"))
             self.headless_var.set(config.get("headless", False))
             self.sound_var.set(config.get("sound", True))
             self.popup_var.set(config.get("popup", True))
@@ -1484,15 +1733,18 @@ class AlerterGUI:
             self.auto_post_action_var.set(config.get("auto_post_action", "Detener tras ejecutar"))
             self.auto_target_date_var.set(config.get("auto_target_date", ""))
             self.auto_target_time_var.set(config.get("auto_target_time", ""))
+            self.sura_pref_enabled_var.set(config.get("sura_pref_enabled", False))
+            self.sura_pref_date_var.set(config.get("sura_pref_date", ""))
+            self._normalize_monitor_selection(config)
 
-            if self.startup_var.get():
-                try:
-                    set_startup(True)
-                except Exception:
-                    pass
+            try:
+                set_startup(bool(self.startup_var.get()))
+            except Exception:
+                pass
 
         self._normalize_interval_inputs()
         self._update_interval_controls_state()
+        self._update_sura_pref_controls_state()
 
         self.set_current_filters(
             self.date_start_var.get(),
@@ -1518,6 +1770,7 @@ class AlerterGUI:
             "interval_max": interval_max,
             "interval_random": interval_random,
             "monitor": self.monitor_var.get(),
+            "monitor_id": self._monitor_id_by_label(self.monitor_var.get()),
             "headless": self.headless_var.get(), "sound": self.sound_var.get(),
             "popup": self.popup_var.get(), "alert_block": self.alert_block_var.get(),
             "autosave": self.autosave_var.get(), "startup": self.startup_var.get(),
@@ -1528,6 +1781,8 @@ class AlerterGUI:
             "auto_post_action": self.auto_post_action_var.get(),
             "auto_target_date": self.auto_target_date_var.get().strip(),
             "auto_target_time": self.auto_target_time_var.get().strip(),
+            "sura_pref_enabled": self.sura_pref_enabled_var.get(),
+            "sura_pref_date": self.sura_pref_date_var.get().strip(),
         }
         save_json("config", cfg)
 
@@ -1555,6 +1810,8 @@ class AlerterGUI:
         self.auto_post_action_var.trace_add('write', self.save_config)
         self.auto_target_date_var.trace_add('write', self.save_config)
         self.auto_target_time_var.trace_add('write', self.save_config)
+        self.sura_pref_date_var.trace_add('write', self.save_config)
+        self.sura_pref_enabled_var.trace_add('write', lambda *args: [self._update_sura_pref_controls_state(), self.save_config()])
         self.auto_programar_var.trace_add('write', lambda *args: self._sync_auto_mode("programar"))
         self.auto_reprogram_var.trace_add('write', lambda *args: self._sync_auto_mode("reprogramar"))
 
@@ -1600,10 +1857,13 @@ class AlerterGUI:
         pop.resizable(False, False)
 
         width, height = 520, 250
-        screen_w = self.root.winfo_screenwidth()
-        screen_h = self.root.winfo_screenheight()
-        x = (screen_w // 2) - (width // 2)
-        y = (screen_h // 2) - (height // 2)
+        monitor = self._selected_monitor() or {}
+        screen_w = int(monitor.get("width", self.root.winfo_screenwidth()))
+        screen_h = int(monitor.get("height", self.root.winfo_screenheight()))
+        monitor_left = int(monitor.get("left", 0))
+        monitor_top = int(monitor.get("top", 0))
+        x = monitor_left + (screen_w // 2) - (width // 2)
+        y = monitor_top + (screen_h // 2) - (height // 2)
         pop.geometry(f"{width}x{height}+{x}+{y}")
 
         container = tk.Frame(pop, bg=theme["bg"], padx=18, pady=16)
@@ -1823,6 +2083,11 @@ class AlerterGUI:
         if target_time and not validate_time_format(target_time):
             errors.append(f"❌ Hora Objetivo inválida: '{target_time}'\n   Usa: HH:MM (Ej: 17:00)")
 
+        sura_pref_enabled = bool(self.sura_pref_enabled_var.get())
+        sura_pref_date = self.sura_pref_date_var.get().strip()
+        if sura_pref_enabled and sura_pref_date and not validate_date_format(sura_pref_date):
+            errors.append(f"❌ Fecha preferida SURA inválida: '{sura_pref_date}'\n   Usa: DD/MM/AAAA (Ej: 25/04/2026)")
+
         if (self.auto_programar_var.get() or self.auto_reprogram_var.get()) and (not target_date) and (not target_time):
             if "continuar" in str(self.auto_post_action_var.get() or "").lower():
                 errors.append("❌ Sin día/hora objetivo no se permite 'Continuar buscando'. Debe quedar en 'Detener tras ejecutar'.")
@@ -1867,6 +2132,10 @@ class AlerterGUI:
                 success_msg += f"\n📅 Día objetivo: {target_date}"
             if target_time:
                 success_msg += f"\n🎯 Hora objetivo: {target_time}"
+            if sura_pref_enabled:
+                success_msg += "\n🧭 Preferencia consulta SURA: activa"
+                if sura_pref_date:
+                    success_msg += f" ({sura_pref_date})"
             
             self.log("✅ Filtros validados y actualizados correctamente.")
             messagebox.showinfo("Filtros Aplicados", success_msg.strip())
@@ -1900,10 +2169,14 @@ class AlerterGUI:
         w, h = 820, 620
         screen_w, screen_h = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
         
-        pref = self.monitor_var.get()
-        x_offset = screen_w if "Derecha" in pref else (-screen_w if "Izquierda" in pref else 0)
-        x = x_offset + (screen_w // 2) - (w // 2)
-        y = (screen_h // 2) - (h // 2)
+        monitor = self._selected_monitor() or {}
+        screen_w = int(monitor.get("width", self.root.winfo_screenwidth()))
+        screen_h = int(monitor.get("height", self.root.winfo_screenheight()))
+        monitor_left = int(monitor.get("left", 0))
+        monitor_top = int(monitor.get("top", 0))
+
+        x = monitor_left + (screen_w // 2) - (w // 2)
+        y = monitor_top + (screen_h // 2) - (h // 2)
         
         pop.geometry(f"{w}x{h}+{x}+{y}")
         pop.configure(bg="#28a745") 
@@ -2095,7 +2368,8 @@ class AlerterGUI:
         ttk.Button(alert_frame, text="🔄 Aplicar nuevo intervalo", command=self.refresh_runtime_interval, style="Action.TButton").pack(fill=tk.X, pady=(2, 6))
 
         ttk.Label(alert_frame, text="Monitor de Pop-up:").pack(anchor=tk.W)
-        ttk.Combobox(alert_frame, textvariable=self.monitor_var, values=["Pantalla Principal (1)", "Pantalla Secundaria (Izquierda)", "Pantalla Secundaria (Derecha)"], state="readonly", width=18).pack(anchor=tk.W, pady=(0,5))
+        self.monitor_combo = ttk.Combobox(alert_frame, textvariable=self.monitor_var, values=self._monitor_combo_values(), state="readonly", width=30)
+        self.monitor_combo.pack(anchor=tk.W, pady=(0,5))
         
         ttk.Checkbutton(alert_frame, text="Sonido Alarma", variable=self.sound_var).pack(anchor=tk.W, pady=2)
         ttk.Checkbutton(alert_frame, text="Súper Pop-Up Verde", variable=self.popup_var).pack(anchor=tk.W, pady=2)
@@ -2128,6 +2402,18 @@ class AlerterGUI:
 
         ttk.Label(alert_frame, text="Hora objetivo (HH:MM, opcional):").pack(anchor=tk.W)
         ttk.Entry(alert_frame, textvariable=self.auto_target_time_var, width=14).pack(anchor=tk.W, pady=(0, 5))
+
+        ttk.Separator(alert_frame, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=6)
+        ttk.Checkbutton(
+            alert_frame,
+            text="Preferencia de consulta SURA (usar fecha deseada)",
+            variable=self.sura_pref_enabled_var,
+            command=self._update_sura_pref_controls_state,
+        ).pack(anchor=tk.W, pady=(2, 2))
+        ttk.Label(alert_frame, text="Fecha preferida SURA (DD/MM/AAAA):").pack(anchor=tk.W)
+        self.sura_pref_date_entry = ttk.Entry(alert_frame, textvariable=self.sura_pref_date_var, width=14)
+        self.sura_pref_date_entry.pack(anchor=tk.W, pady=(0, 5))
+        self._update_sura_pref_controls_state()
 
         btn_frame = ttk.Frame(left_panel)
         btn_frame.pack(fill=tk.X, pady=(10, 0))
@@ -2253,6 +2539,8 @@ class AlerterGUI:
             errors.append(f"❌ Día Objetivo: '{target_date}'")
         if target_time and not validate_time_format(target_time):
             errors.append(f"❌ Hora Objetivo: '{target_time}'")
+        if self.sura_pref_enabled_var.get() and self.sura_pref_date_var.get().strip() and (not validate_date_format(self.sura_pref_date_var.get().strip())):
+            errors.append(f"❌ Fecha preferida SURA: '{self.sura_pref_date_var.get().strip()}'")
 
         if (self.auto_programar_var.get() or self.auto_reprogram_var.get()) and (not target_date) and (not target_time):
             if "continuar" in str(self.auto_post_action_var.get() or "").lower():
@@ -2289,6 +2577,11 @@ class AlerterGUI:
                 filtro_desc += f" | Día objetivo {target_date}"
             if target_time:
                 filtro_desc += f" | Objetivo {target_time}"
+            if self.sura_pref_enabled_var.get():
+                pref_date = self.sura_pref_date_var.get().strip()
+                filtro_desc += " | Preferencia consulta SURA activa"
+                if pref_date:
+                    filtro_desc += f" ({pref_date})"
             self.log(filtro_desc)
         else:
             self.log("📋 Sin filtros activos - buscando todas las citas")
